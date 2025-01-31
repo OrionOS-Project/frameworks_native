@@ -1293,6 +1293,7 @@ private:
     std::atomic_bool mForceFullDamage = false;
 
     bool mLayerCachingEnabled = false;
+    bool mPropagateBackpressure = true;
     bool mBackpressureGpuComposition = false;
 
     LayerTracing mLayerTracing;
@@ -1356,6 +1357,12 @@ private:
     scheduler::PresentLatencyTracker mPresentLatencyTracker GUARDED_BY(kMainThreadContext);
 
     bool mLumaSampling = true;
+    bool mForceLightBrightness = false;
+    bool mForceHwcBrightness = false;
+
+    bool mDeferRefreshRateWhenOff = false;
+    std::optional<scheduler::FrameRateMode> mLastActiveMode GUARDED_BY(mStateLock);
+
     sp<RegionSamplingThread> mRegionSamplingThread;
     sp<FpsReporter> mFpsReporter;
     sp<TunnelModeEnabledReporter> mTunnelModeEnabledReporter;

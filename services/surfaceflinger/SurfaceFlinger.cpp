@@ -484,6 +484,10 @@ SurfaceFlinger::SurfaceFlinger(Factory& factory) : SurfaceFlinger(factory, SkipI
 
     mDebugFlashDelay = base::GetUintProperty("debug.sf.showupdates"s, 0u);
 
+    property_get("debug.sf.disable_backpressure", value, "0");
+    mPropagateBackpressure = !atoi(value);
+    ALOGI_IF(!mPropagateBackpressure, "Disabling backpressure propagation");
+
     mBackpressureGpuComposition = base::GetBoolProperty("debug.sf.enable_gl_backpressure"s, true);
     ALOGI_IF(mBackpressureGpuComposition, "Enabling backpressure for GPU composition");
 
@@ -507,8 +511,17 @@ SurfaceFlinger::SurfaceFlinger(Factory& factory) : SurfaceFlinger(factory, SkipI
     property_get("debug.sf.dim_in_gamma_in_enhanced_screenshots", value, 0);
     mDimInGammaSpaceForEnhancedScreenshots = atoi(value);
 
+    property_get("debug.sf.defer_refresh_rate_when_off", value, "0");
+    mDeferRefreshRateWhenOff = atoi(value);
+
     mIgnoreHwcPhysicalDisplayOrientation =
             base::GetBoolProperty("debug.sf.ignore_hwc_physical_display_orientation"s, false);
+
+    property_get("ro.sf.force_light_brightness", value, "0");
+    mForceLightBrightness = atoi(value);
+
+    property_get("ro.sf.force_hwc_brightness", value, "0");
+    mForceHwcBrightness = atoi(value);
 
     // We should be reading 'persist.sys.sf.color_saturation' here
     // but since /data may be encrypted, we need to wait until after vold
@@ -544,10 +557,12 @@ SurfaceFlinger::SurfaceFlinger(Factory& factory) : SurfaceFlinger(factory, SkipI
 }
 
 LatchUnsignaledConfig SurfaceFlinger::getLatchUnsignaledConfig() {
+    if (base::GetBoolProperty("debug.sf.latch_unsignaled"s, false)) {
+        return LatchUnsignaledConfig::Always;
+    }
     if (base::GetBoolProperty("debug.sf.auto_latch_unsignaled"s, true)) {
         return LatchUnsignaledConfig::AutoSingleLayer;
     }
-
     return LatchUnsignaledConfig::Disabled;
 }
 
@@ -1314,8 +1329,15 @@ status_t SurfaceFlinger::getDisplayStats(const sp<IBinder>& displayToken,
 void SurfaceFlinger::setDesiredMode(display::DisplayModeRequest&& desiredMode) {
     const auto mode = desiredMode.mode;
     const auto displayId = mode.modePtr->getPhysicalDisplayId();
+    const auto desiredDisplay = getDisplayDeviceLocked(displayId);
 
     SFTRACE_NAME(ftl::Concat(__func__, ' ', displayId.value).c_str());
+
+    if (mDeferRefreshRateWhenOff && desiredDisplay && desiredDisplay->getPowerMode() == hal::PowerMode::OFF) {
+        ALOGI("%s: deferring because display is powered off", __func__);
+        mLastActiveMode = mode;
+        return;
+    }
 
     const bool emitEvent = desiredMode.emitEvent;
 
@@ -1993,7 +2015,9 @@ status_t SurfaceFlinger::getDisplayBrightnessSupport(const sp<IBinder>& displayT
     if (!displayId) {
         return NAME_NOT_FOUND;
     }
-    *outSupport = getHwComposer().hasDisplayCapability(*displayId, DisplayCapability::BRIGHTNESS);
+
+    *outSupport = mForceHwcBrightness ? true : mForceLightBrightness ? false :
+            getHwComposer().hasDisplayCapability(*displayId, DisplayCapability::BRIGHTNESS);
     return NO_ERROR;
 }
 
@@ -2585,7 +2609,7 @@ bool SurfaceFlinger::commit(PhysicalDisplayId pacesetterId,
     }
 
     if (pacesetterFrameTarget.wouldBackpressureHwc()) {
-        if (mBackpressureGpuComposition || pacesetterFrameTarget.didMissHwcFrame()) {
+        if (mPropagateBackpressure && (mBackpressureGpuComposition || pacesetterFrameTarget.didMissHwcFrame())) {
             if (FlagManager::getInstance().vrr_config()) {
                 mScheduler->getVsyncSchedule()->getTracker().onFrameMissed(
                         pacesetterFrameTarget.expectedPresentTime());
@@ -3480,7 +3504,7 @@ bool SurfaceFlinger::configureLocked() {
                                  ? Config::FrameRateOverride::Enabled
                                  : Config::FrameRateOverride::Disabled,
                          .frameRateMultipleThreshold =
-                                 base::GetIntProperty("debug.sf.frame_rate_multiple_threshold"s, 0),
+                                 base::GetIntProperty("debug.sf.frame_rate_multiple_threshold"s, 60),
                          .legacyIdleTimerTimeout = idleTimerTimeoutMs,
                          .kernelIdleTimerController = kernelIdleTimerController};
 
@@ -4325,6 +4349,9 @@ void SurfaceFlinger::initScheduler(const sp<const DisplayDevice>& display) {
     if (mBackpressureGpuComposition) {
         features |= Feature::kBackpressureGpuComposition;
     }
+    if (mPropagateBackpressure) {
+        features |= Feature::kPropagateBackpressure;
+    }
     if (getHwComposer().getComposer()->isSupported(
                 Hwc2::Composer::OptionalFeature::ExpectedPresentTime)) {
         features |= Feature::kExpectedPresentTime;
@@ -4560,10 +4587,13 @@ TransactionHandler::TransactionReadiness SurfaceFlinger::transactionReadyBufferC
                     return TraverseBuffersReturnValues::STOP_TRAVERSAL;
                 }
 
+                // ignore the acquire fence if LatchUnsignaledConfig::Always is set.
+                const bool checkAcquireFence =
+                        enableLatchUnsignaledConfig != LatchUnsignaledConfig::Always;
                 const bool acquireFenceAvailable = s.bufferData &&
                         s.bufferData->flags.test(BufferData::BufferDataChange::fenceChanged) &&
                         s.bufferData->acquireFence;
-                const bool fenceSignaled = !acquireFenceAvailable ||
+                const bool fenceSignaled = !checkAcquireFence || !acquireFenceAvailable ||
                         s.bufferData->acquireFence->getStatus() != Fence::Status::Unsignaled;
                 if (!fenceSignaled) {
                     // check fence status
@@ -4664,6 +4694,11 @@ bool SurfaceFlinger::shouldLatchUnsignaled(const layer_state_t& state, size_t nu
     if (enableLatchUnsignaledConfig == LatchUnsignaledConfig::Disabled) {
         SFTRACE_FORMAT_INSTANT("%s: false (LatchUnsignaledConfig::Disabled)", __func__);
         return false;
+    }
+
+    if (enableLatchUnsignaledConfig == LatchUnsignaledConfig::Always) {
+        SFTRACE_FORMAT_INSTANT("%s: true (LatchUnsignaledConfig::Always)", __func__);
+        return true;
     }
 
     // We only want to latch unsignaled when a single layer is updated in this
@@ -5372,6 +5407,11 @@ void SurfaceFlinger::setPowerModeInternal(const sp<DisplayDevice>& display, hal:
         }
 
         getHwComposer().setPowerMode(displayId, mode);
+        if (mLastActiveMode) {
+            ALOGI("Deferred active mode change pending, applying now");
+            setDesiredMode({mLastActiveMode.value()});
+            mLastActiveMode = std::nullopt;
+        }
         if (mode != hal::PowerMode::DOZE_SUSPEND &&
             (displayId == mActiveDisplayId || FlagManager::getInstance().multithreaded_present())) {
             const bool enable =
